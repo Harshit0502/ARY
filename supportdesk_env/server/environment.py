@@ -4,7 +4,15 @@ import uuid
 from copy import deepcopy
 from typing import Any, Dict, List
 
-from ..models import SupportAction, SupportObservation, SupportReward, SupportState, StepResult
+from ..models import (
+    HiddenTicketState,
+    SupportAction,
+    SupportObservation,
+    SupportPublicState,
+    SupportReward,
+    SupportState,
+    StepResult,
+)
 from ..task_bank import TASK_ORDER, get_task, next_task_id
 
 
@@ -20,6 +28,14 @@ class SupportDeskEnvironment:
             self.reset()
         assert self._state is not None
         return self._state
+    @property
+    def public_state(self) -> SupportPublicState:
+        if self._state is None:
+            self.reset()
+        assert self._state is not None
+        return self._build_public_state()
+    
+
 
     def reset(
         self,
@@ -55,6 +71,7 @@ class SupportDeskEnvironment:
             escalation_state={},
             resolution_state={},
             verification_state={},
+            hidden_state=HiddenTicketState(**deepcopy(task.hidden_case)),
             close_attempts=0,
         )
         observation = self._build_observation(task, last_feedback="Fresh case loaded.", done=False)
@@ -286,13 +303,13 @@ class SupportDeskEnvironment:
         return self._result(
             feedback=feedback,
             partial=partial,
-            penalty=penalty,
             violations=violations,
             info={"draft_hits": required_hits, "draft_total": required_total},
         )
-
     def _handle_escalate_case(self, task, action: SupportAction) -> Dict[str, Any]:
         assert self._state is not None
+        hidden = self._state.hidden_state
+
         payload = {
             "team": action.team,
             "priority": action.priority,
@@ -305,37 +322,44 @@ class SupportDeskEnvironment:
         self._record_meaningful_step("escalate_case")
         self._state.verification_state["escalated"] = True
 
-        expected = task.expected_resolution
         partial = {"escalation": 0.08}
         penalty = 0.0
         feedback = "Case escalation recorded."
 
-        if expected.get("team") and action.team == expected.get("team"):
-            partial["team_match"] = 0.05
-        elif expected.get("team"):
-            penalty += 0.04
-            feedback = f"Escalation recorded, but expected team is closer to '{expected.get('team')}'."
-
-        if expected.get("priority") and action.priority == expected.get("priority"):
-            partial["priority_match"] = 0.04
-        elif "escalate_case" in task.required_actions and expected.get("priority"):
-            penalty += 0.03
-
-        if expected.get("severity"):
-            if action.severity == expected.get("severity"):
-                partial["severity_match"] = 0.05
+        if hidden.escalation_required:
+            if action.team == hidden.correct_team:
+                partial["team_match"] = 0.05
             else:
-                penalty += 0.05
-                feedback = f"Escalation recorded, but severity should be closer to '{expected.get('severity')}'."
+                penalty += 0.04
+
+            if action.priority == hidden.correct_priority:
+                partial["priority_match"] = 0.04
+            else:
+                penalty += 0.03
+
+            if hidden.correct_severity:
+                if action.severity == hidden.correct_severity:
+                    partial["severity_match"] = 0.05
+                else:
+                    penalty += 0.05
+
+            if penalty > 0:
+                feedback = "Escalation recorded, but the escalation details may still need correction."
+            else:
+                feedback = "Escalation recorded with incident-appropriate routing."
+        else:
+            penalty += 0.04
+            feedback = "Escalation recorded, but this case may not require escalation."
 
         return self._result(
             feedback=feedback,
             partial=partial,
             penalty=penalty,
         )
-
     def _handle_resolution_action(self, task, action: SupportAction) -> Dict[str, Any]:
         assert self._state is not None
+        hidden = self._state.hidden_state
+
         if not action.resolution_type:
             return self._result(
                 feedback="take_resolution_action requires resolution_type.",
@@ -353,39 +377,63 @@ class SupportDeskEnvironment:
         self._record_meaningful_step("take_resolution_action")
         self._state.verification_state["resolution_taken"] = True
 
-        expected = task.expected_resolution
         partial = {"resolution_action": 0.10}
         penalty = 0.0
         feedback = "Resolution action recorded."
 
-        if action.resolution_type == expected.get("resolution_type"):
+        hidden.issue_resolved = False
+        hidden.wrong_action_caused_damage = False
+
+        if action.resolution_type == hidden.correct_resolution_type:
             partial["resolution_match"] = 0.10
+            hidden.issue_resolved = True
         else:
             penalty += 0.08
-            feedback = f"Resolution action recorded, but expected '{expected.get('resolution_type')}'."
+            feedback = "Resolution action recorded, but it may not correctly address the case."
 
-        expected_tags = set(expected.get("required_tags", []))
+        expected_tags = set(task.expected_resolution.get("required_tags", []))
         provided_tags = set(action.tags)
         if expected_tags:
             matched = len(expected_tags & provided_tags)
             partial["tag_alignment"] = round(0.04 * (matched / len(expected_tags)), 4)
 
-        if expected.get("resolution_type") == "publish_status_update" and expected.get("workaround_available"):
-            workaround_text = str(action.resolution_payload.get("workaround", "")).lower()
-            if workaround_text:
-                partial["workaround_recorded"] = 0.04
-            else:
-                penalty += 0.03
-                feedback = "Status action recorded, but the approved workaround was not captured."
+        if action.resolution_type == "issue_refund":
+            if hidden.correct_resolution_type != "issue_refund":
+                hidden.wrong_action_caused_damage = True
+                hidden.issue_resolved = False
+                penalty += 0.08
+                feedback = "Resolution action recorded, but it conflicts with the case needs."
+            elif hidden.refund_eligible is False:
+                hidden.wrong_action_caused_damage = True
+                hidden.issue_resolved = False
+                penalty += 0.08
+                feedback = "Resolution action recorded, but it conflicts with the case policy."
+            elif hidden.refund_eligible is True:
+                partial["policy_safe_resolution"] = 0.04
+
+        if hidden.correct_resolution_type == "publish_status_update":
+            workaround_required = bool(task.expected_resolution.get("workaround_available"))
+            workaround_text = str(action.resolution_payload.get("workaround", "")).strip()
+
+            if action.resolution_type == "publish_status_update":
+                if workaround_required and workaround_text:
+                    partial["workaround_recorded"] = 0.04
+                    hidden.issue_resolved = True
+                elif workaround_required and not workaround_text:
+                    penalty += 0.03
+                    hidden.issue_resolved = False
+                    feedback = "Status action recorded, but an important operational detail is still missing."
 
         return self._result(
             feedback=feedback,
             partial=partial,
             penalty=penalty,
         )
-
+    
     def _handle_close_ticket(self, task, action: SupportAction) -> Dict[str, Any]:
         assert self._state is not None
+        hidden = self._state.hidden_state
+
         self._state.close_attempts += 1
         missing = self._missing_close_requirements(task)
         if missing:
@@ -403,12 +451,34 @@ class SupportDeskEnvironment:
             self._state.resolution_state["final_status"] = expected_status
 
         return self._result(
-            feedback=task.expected_resolution.get("close_note", "Ticket closed after successful workflow completion."),
+            feedback=hidden.close_note or "Ticket closed after successful workflow completion.",
             partial={"close_success": 0.24},
             penalty=0.0,
             done=True,
         )
 
+    def _build_public_state(self) -> SupportPublicState:
+        assert self._state is not None
+        return SupportPublicState(
+            episode_id=self._state.episode_id,
+            task_id=self._state.task_id,
+            turn=self._state.turn,
+            max_turns=self._state.max_turns,
+            done=self._state.done,
+            cumulative_score=self._state.cumulative_score,
+            best_score=self._state.best_score,
+            last_reward=self._state.last_reward,
+            revealed_sections=deepcopy(self._state.revealed_sections),
+            revealed_data=deepcopy(self._state.revealed_data),
+            close_attempts=self._state.close_attempts,
+            draft_exists=bool(self._state.draft_message),
+            escalation_recorded=bool(self._state.escalation_state),
+            resolution_recorded=bool(self._state.resolution_state),
+            action_history=self._public_action_history(),
+            can_close=self._can_close(get_task(self._state.task_id)),
+        )
+
+    
     def _build_observation(self, task, last_feedback: str, done: bool = False) -> SupportObservation:
         assert self._state is not None
         return SupportObservation(
@@ -466,9 +536,10 @@ class SupportDeskEnvironment:
 
     def _can_close(self, task) -> bool:
         return len(self._missing_close_requirements(task)) == 0
-
+    
     def _missing_close_requirements(self, task) -> List[str]:
         assert self._state is not None
+        hidden = self._state.hidden_state
         missing: List[str] = []
 
         if len(self._state.meaningful_steps) < task.min_meaningful_steps:
@@ -481,36 +552,41 @@ class SupportDeskEnvironment:
             if action_name == "close_ticket":
                 continue
             if action_name not in taken:
-                missing.append(f"required action '{action_name}' not completed")
+                missing.append(f"required workflow step '{action_name}' not completed")
 
         revealed = set(self._state.revealed_sections)
         for section in task.required_revealed_sections:
             if section not in revealed:
                 missing.append(f"required data section '{section}' not revealed")
 
-        expected = task.expected_resolution
-        expected_resolution_type = expected.get("resolution_type")
-        if expected_resolution_type and self._state.resolution_state.get("resolution_type") != expected_resolution_type:
-            missing.append(f"resolution_type should be '{expected_resolution_type}'")
+        if not self._state.resolution_state:
+            missing.append("a concrete operational resolution has not been recorded")
+        elif not hidden.issue_resolved:
+            missing.append("the recorded resolution does not yet appear workflow-complete")
 
-        if "escalate_case" in task.required_actions:
+        if hidden.escalation_required:
             if not self._state.escalation_state:
-                missing.append("escalation details not recorded")
+                missing.append("required escalation details are still missing")
             else:
-                if expected.get("team") and self._state.escalation_state.get("team") != expected.get("team"):
-                    missing.append(f"escalation team should be '{expected.get('team')}'")
-                if expected.get("priority") and self._state.escalation_state.get("priority") != expected.get("priority"):
-                    missing.append(f"escalation priority should be '{expected.get('priority')}'")
-                if expected.get("severity") and self._state.escalation_state.get("severity") != expected.get("severity"):
-                    missing.append(f"escalation severity should be '{expected.get('severity')}'")
+                escalation_ok = True
+                if hidden.correct_team and self._state.escalation_state.get("team") != hidden.correct_team:
+                    escalation_ok = False
+                if hidden.correct_priority and self._state.escalation_state.get("priority") != hidden.correct_priority:
+                    escalation_ok = False
+                if hidden.correct_severity and self._state.escalation_state.get("severity") != hidden.correct_severity:
+                    escalation_ok = False
+                if not escalation_ok:
+                    missing.append("escalation details are incomplete or incorrect")
 
         if not self._state.draft_message:
             missing.append("draft response missing")
         elif not self._draft_requirements_met(task):
             missing.append("draft response is missing required customer-facing details")
 
-        return missing
+        if hidden.wrong_action_caused_damage:
+            missing.append("a previous action introduced case risk and should be corrected before closing")
 
+        return missing
     def _draft_requirements_met(self, task) -> bool:
         assert self._state is not None
         message = (self._state.draft_message or "").lower()

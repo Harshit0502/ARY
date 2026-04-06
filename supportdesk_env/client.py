@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 
-from .models import SupportAction, StepResult, SupportObservation, SupportState
+from .models import SupportAction, StepResult, SupportPublicState
 
 
 @dataclass
@@ -25,10 +25,10 @@ class SupportDeskClient:
         resp.raise_for_status()
         return StepResult.model_validate(resp.json())
 
-    def state(self) -> SupportState:
+    def state(self) -> SupportPublicState:
         resp = requests.get(f"{self.base_url}/state", timeout=self.timeout)
         resp.raise_for_status()
-        return SupportState.model_validate(resp.json())
+        return SupportPublicState.model_validate(resp.json())
 
     def health(self) -> Dict[str, Any]:
         resp = requests.get(f"{self.base_url}/health", timeout=self.timeout)

@@ -15,6 +15,8 @@ DEFAULT_ALLOWED_ACTIONS: List[str] = [
     "close_ticket",
 ]
 
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 @dataclass(frozen=True)
 class TaskSpec:
@@ -22,19 +24,16 @@ class TaskSpec:
     title: str
     difficulty: str
 
-    # Public information shown at reset
     public_inbox_summary: str
     public_open_questions: List[str]
     constraints: List[str]
 
-    # Hidden case world the agent must discover
     customer_record: Dict[str, Any]
     order_record: Optional[Dict[str, Any]]
     payment_record: Optional[Dict[str, Any]]
     previous_tickets: List[Dict[str, Any]]
     policy_docs: Dict[str, str]
 
-    # What a successful workflow should achieve
     expected_resolution: Dict[str, Any]
     required_actions: List[str]
     required_revealed_sections: List[str]
@@ -43,8 +42,22 @@ class TaskSpec:
 
     max_turns: int = 6
     allowed_actions: List[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_ACTIONS))
+    hidden_case: Dict[str, Any] = field(default_factory=dict)
+    hidden_case={
+    "actual_issue_type": "login_access",
+    "required_policy_keys": ["account_access", "password_reset"],
+    "refund_eligible": None,
+    "escalation_required": False,
+    "customer_sentiment": "frustrated",
+    "issue_resolved": False,
+    "wrong_action_caused_damage": False,
+    "correct_resolution_type": "reissue_reset_link",
+    "correct_team": "account_access",
+    "correct_priority": "medium",
+    "correct_severity": None,
+    "close_note": "Safe account-access guidance sent and reset link reissued.",
+},
 
-    # Compatibility helpers while the rest of the repo is still being migrated
     @property
     def inbox_summary(self) -> str:
         return self.public_inbox_summary
@@ -52,7 +65,6 @@ class TaskSpec:
     @property
     def open_questions(self) -> List[str]:
         return self.public_open_questions
-
 
 TASKS: Dict[str, TaskSpec] = {
     "login_lockout": TaskSpec(
@@ -106,6 +118,20 @@ TASKS: Dict[str, TaskSpec] = {
                 "If the account is active and not locked, a reset link may be reissued. "
                 "The response should explain that email delivery delays or spam filtering can occur."
             ),
+        },
+        hidden_case={
+            "actual_issue_type": "login_access",
+            "required_policy_keys": ["account_access", "password_reset"],
+            "refund_eligible": None,
+            "escalation_required": False,
+            "customer_sentiment": "frustrated",
+            "issue_resolved": False,
+            "wrong_action_caused_damage": False,
+            "correct_resolution_type": "reissue_reset_link",
+            "correct_team": "account_access",
+            "correct_priority": "medium",
+            "correct_severity": None,
+            "close_note": "Safe account-access guidance sent and reset link reissued.",
         },
         expected_resolution={
             "team": "account_access",
@@ -215,6 +241,20 @@ TASKS: Dict[str, TaskSpec] = {
                 "Mark the case for duplicate-charge review and note the source payment IDs."
             ),
         },
+        hidden_case={
+    "actual_issue_type": "duplicate_billing_charge",
+    "required_policy_keys": ["billing_refunds", "duplicate_charge"],
+    "refund_eligible": True,
+    "escalation_required": False,
+    "customer_sentiment": "frustrated",
+    "issue_resolved": False,
+    "wrong_action_caused_damage": False,
+    "correct_resolution_type": "issue_refund",
+    "correct_team": "billing",
+    "correct_priority": "high",
+    "correct_severity": None,
+    "close_note": "Duplicate charge verified and refund issued to original payment method.",
+},
         expected_resolution={
             "team": "billing",
             "priority": "high",
@@ -297,6 +337,20 @@ TASKS: Dict[str, TaskSpec] = {
                 "Include a workaround only when one is known and verified."
             ),
         },
+        hidden_case={
+    "actual_issue_type": "regional_service_outage",
+    "required_policy_keys": ["incident_response", "public_comms"],
+    "refund_eligible": None,
+    "escalation_required": True,
+    "customer_sentiment": "urgent",
+    "issue_resolved": False,
+    "wrong_action_caused_damage": False,
+    "correct_resolution_type": "publish_status_update",
+    "correct_team": "incident_management",
+    "correct_priority": "urgent",
+    "correct_severity": "sev2",
+    "close_note": "Incident escalated correctly and safe customer-facing update prepared.",
+},
         expected_resolution={
             "team": "incident_management",
             "priority": "urgent",

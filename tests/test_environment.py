@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from supportdesk_env.models import SupportAction
 from supportdesk_env.server.environment import SupportDeskEnvironment
+from fastapi.testclient import TestClient
+from supportdesk_env.server.app import APP_STATE, app
 
 
 def test_reset_starts_with_partial_information() -> None:
@@ -349,3 +351,149 @@ def test_turn_limit_ends_incomplete_episode() -> None:
     assert result is not None
     assert result.done is True
     assert result.info["done_reason"] == "max_turns"
+
+def test_public_state_redacts_hidden_ticket_truth() -> None:
+    env = SupportDeskEnvironment()
+    env.reset(task_id="duplicate_charge_refund")
+
+    public_state = env.public_state
+    dumped = public_state.model_dump()
+
+    forbidden_keys = {
+        "hidden_state",
+        "transcript",
+        "violations",
+        "verification_state",
+        "resolution_state",
+        "escalation_state",
+        "draft_message",
+        "last_action",
+        "last_observation",
+        "meaningful_steps",
+    }
+
+    for key in forbidden_keys:
+        assert key not in dumped
+
+
+def test_public_state_does_not_expose_private_ticket_answers_after_progress() -> None:
+    env = SupportDeskEnvironment()
+    env.reset(task_id="eu_outage_incident")
+
+    env.step(
+        SupportAction(
+            action_type="search_customer",
+            query="eu outage affected tenant lookup",
+            confidence=0.8,
+        )
+    )
+    env.step(
+        SupportAction(
+            action_type="check_policy",
+            policy_key="incident_response",
+            confidence=0.85,
+        )
+    )
+
+    public_state = env.public_state
+    dumped = public_state.model_dump()
+    text = str(dumped)
+
+    forbidden_strings = [
+        "actual_issue_type",
+        "required_policy_keys",
+        "refund_eligible",
+        "escalation_required",
+        "customer_sentiment",
+        "issue_resolved",
+        "wrong_action_caused_damage",
+        "correct_resolution_type",
+        "correct_team",
+        "correct_priority",
+        "correct_severity",
+    ]
+
+    for item in forbidden_strings:
+        assert item not in text
+
+
+def test_close_feedback_does_not_leak_exact_target_answer() -> None:
+    env = SupportDeskEnvironment()
+    env.reset(task_id="duplicate_charge_refund")
+
+    result = env.step(SupportAction(action_type="close_ticket", confidence=0.2))
+
+    assert result.done is False
+    assert result.reward.total < 0
+
+    feedback = result.observation.last_feedback
+    missing = result.info.get("missing_requirements", [])
+    combined = feedback + " || " + " || ".join(missing)
+
+    forbidden_strings = [
+        "issue_refund",
+        "incident_management",
+        "sev2",
+        "urgent",
+        "reissue_reset_link",
+        "publish_status_update",
+    ]
+
+    for item in forbidden_strings:
+        assert item not in combined
+
+
+def test_wrong_action_damage_is_tracked_privately_not_publicly() -> None:
+    env = SupportDeskEnvironment()
+    env.reset(task_id="login_lockout")
+
+    result = env.step(
+        SupportAction(
+            action_type="take_resolution_action",
+            resolution_type="issue_refund",
+            status="completed",
+            tags=["billing", "refund"],
+            resolution_payload={"reason": "goodwill"},
+            confidence=0.8,
+        )
+    )
+
+    assert result.done is False
+    assert env.state.hidden_state.wrong_action_caused_damage is True
+
+    public_state = env.public_state.model_dump()
+    public_text = str(public_state)
+
+    assert "wrong_action_caused_damage" not in public_text
+    assert "hidden_state" not in public_text
+
+
+def test_public_state_shows_progress_without_exposing_solution() -> None:
+    env = SupportDeskEnvironment()
+    env.reset(task_id="duplicate_charge_refund")
+
+    env.step(
+        SupportAction(
+            action_type="search_customer",
+            query="duplicate subscription charge customer lookup",
+            confidence=0.8,
+        )
+    )
+    env.step(
+        SupportAction(
+            action_type="view_order",
+            customer_id="cust_2042",
+            confidence=0.85,
+        )
+    )
+
+    public_state = env.public_state
+
+    assert public_state.task_id == "duplicate_charge_refund"
+    assert public_state.turn == 2
+    assert public_state.draft_exists is False
+    assert public_state.escalation_recorded is False
+    assert public_state.resolution_recorded is False
+    assert "customer" in public_state.revealed_data
+    assert "order" in public_state.revealed_data
+    assert "payment" in public_state.revealed_data

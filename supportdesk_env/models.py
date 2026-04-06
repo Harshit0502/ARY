@@ -17,8 +17,6 @@ except Exception:  # pragma: no cover - fallback for standalone execution
 
 
 class SupportAction(OpenEnvAction):
-    """A single operational action in the support workflow."""
-
     model_config = ConfigDict(extra="forbid")
 
     action_type: Literal[
@@ -30,216 +28,138 @@ class SupportAction(OpenEnvAction):
         "escalate_case",
         "take_resolution_action",
         "close_ticket",
-    ] = Field(
-        ...,
-        description="Exactly one next step the agent wants to perform.",
-    )
+    ] = Field(...)
 
-    query: Optional[str] = Field(
-        default=None,
-        description="Free-text lookup query, mainly for search_customer.",
-    )
-    customer_id: Optional[str] = Field(
-        default=None,
-        description="Customer identifier if already known.",
-    )
-    order_id: Optional[str] = Field(
-        default=None,
-        description="Order identifier if already known.",
-    )
-    policy_key: Optional[str] = Field(
-        default=None,
-        description="Policy document or policy topic to inspect.",
-    )
+    query: Optional[str] = None
+    customer_id: Optional[str] = None
+    order_id: Optional[str] = None
+    policy_key: Optional[str] = None
 
-    team: Optional[str] = Field(
-        default=None,
-        description="Owning team for escalation or routing.",
-    )
-    priority: Optional[Literal["low", "medium", "high", "urgent"]] = Field(
-        default=None,
-        description="Priority selected for escalation or follow-up.",
-    )
-    severity: Optional[Literal["sev4", "sev3", "sev2", "sev1"]] = Field(
-        default=None,
-        description="Incident severity for outage or incident cases.",
-    )
-    status: Optional[str] = Field(
-        default=None,
-        description="Status update for escalation or resolution tracking.",
-    )
-    tags: List[str] = Field(
-        default_factory=list,
-        description="Tags to attach to the case.",
-    )
+    team: Optional[str] = None
+    priority: Optional[Literal["low", "medium", "high", "urgent"]] = None
+    severity: Optional[Literal["sev4", "sev3", "sev2", "sev1"]] = None
+    status: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
 
-    message: Optional[str] = Field(
-        default=None,
-        description="Customer-facing draft for draft_response.",
-    )
-    internal_note: Optional[str] = Field(
-        default=None,
-        description="Internal note for escalation, verification, or audit trail.",
-    )
+    message: Optional[str] = None
+    internal_note: Optional[str] = None
 
-    resolution_type: Optional[str] = Field(
-        default=None,
-        description="Operational resolution, e.g. issue_refund, reissue_reset_link, workaround_shared.",
-    )
-    resolution_payload: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Structured inputs for the chosen resolution action.",
-    )
+    resolution_type: Optional[str] = None
+    resolution_payload: Dict[str, Any] = Field(default_factory=dict)
 
-    confidence: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="Self-reported confidence for the selected next step.",
-    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class SupportObservation(OpenEnvObservation):
-    """Observation exposed to the agent after each step."""
-
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str = Field(..., description="Current task identifier.")
-    title: str = Field(..., description="Human-readable task title.")
-    difficulty: Literal["easy", "medium", "hard"] = Field(..., description="Task difficulty.")
-    turn: int = Field(..., ge=0, description="Current turn number.")
-    remaining_turns: int = Field(..., ge=0, description="Turns left before automatic termination.")
+    task_id: str
+    title: str
+    difficulty: Literal["easy", "medium", "hard"]
+    turn: int = Field(..., ge=0)
+    remaining_turns: int = Field(..., ge=0)
 
-    inbox_summary: str = Field(
-        ...,
-        description="Minimal user-visible summary available at reset.",
-    )
-    constraints: List[str] = Field(
-        default_factory=list,
-        description="Operational or policy constraints the agent should obey.",
-    )
-    open_questions: List[str] = Field(
-        default_factory=list,
-        description="What remains unknown and may need inspection.",
-    )
+    inbox_summary: str
+    constraints: List[str] = Field(default_factory=list)
+    open_questions: List[str] = Field(default_factory=list)
 
-    available_actions: List[str] = Field(
-        default_factory=list,
-        description="Action types currently allowed by the environment.",
-    )
-    revealed_data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Facts the agent has uncovered so far.",
-    )
-    action_history: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="Compact trace of prior actions and outcomes.",
-    )
+    available_actions: List[str] = Field(default_factory=list)
+    revealed_data: Dict[str, Any] = Field(default_factory=dict)
+    action_history: List[Dict[str, Any]] = Field(default_factory=list)
 
-    last_feedback: str = Field(
-        default="",
-        description="Feedback from the previous step.",
-    )
-    current_score: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="Current progress score, not final correctness only.",
-    )
-    done: bool = Field(
-        default=False,
-        description="Whether the episode has ended.",
-    )
-    can_close: bool = Field(
-        default=False,
-        description="Whether the ticket currently satisfies close prerequisites.",
-    )
+    last_feedback: str = ""
+    current_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    done: bool = False
+    can_close: bool = False
 
 
 class SupportReward(OpenEnvReward):
-    """Reward payload returned by the environment."""
-
     model_config = ConfigDict(extra="forbid")
 
-    total: float = Field(..., description="Total scalar reward for the last step.")
-    partial: Dict[str, float] = Field(default_factory=dict, description="Per-criterion contribution.")
-    penalty: float = Field(default=0.0, description="Penalty applied for undesirable behavior.")
-    explanation: str = Field(default="", description="Short human-readable summary.")
+    total: float
+    partial: Dict[str, float] = Field(default_factory=dict)
+    penalty: float = 0.0
+    explanation: str = ""
 
 
-class SupportState(OpenEnvState):
-    """Internal environment state for a multi-step support workflow."""
-
+class HiddenTicketState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    episode_id: str = Field(..., description="Episode identifier.")
-    task_id: str = Field(..., description="Current task identifier.")
+    actual_issue_type: str = "unknown"
+    required_policy_keys: List[str] = Field(default_factory=list)
+    refund_eligible: Optional[bool] = None
+    escalation_required: bool = False
+    customer_sentiment: Literal["unknown", "calm", "frustrated", "angry", "urgent"] = "unknown"
+    issue_resolved: bool = False
+    wrong_action_caused_damage: bool = False
+
+    correct_resolution_type: Optional[str] = None
+    correct_team: Optional[str] = None
+    correct_priority: Optional[str] = None
+    correct_severity: Optional[str] = None
+    close_note: Optional[str] = None
+
+
+class SupportPublicState(OpenEnvState):
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    task_id: str
 
     turn: int = Field(default=0, ge=0)
     max_turns: int = Field(default=6, ge=1)
-    done: bool = Field(default=False)
+    done: bool = False
 
     cumulative_score: float = Field(default=0.0, ge=0.0, le=1.0)
     best_score: float = Field(default=0.0, ge=0.0, le=1.0)
-    last_reward: float = Field(default=0.0)
+    last_reward: float = 0.0
 
-    transcript: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="Full internal action transcript.",
-    )
-    last_action: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Last action summary.",
-    )
-    last_observation: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Last observation snapshot.",
-    )
-    violations: List[str] = Field(
-        default_factory=list,
-        description="Accumulated policy or workflow violations.",
-    )
+    revealed_sections: List[str] = Field(default_factory=list)
+    revealed_data: Dict[str, Any] = Field(default_factory=dict)
 
-    revealed_sections: List[str] = Field(
-        default_factory=list,
-        description="Named data sections already unlocked, e.g. customer, order, policy.",
-    )
-    revealed_data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="All information uncovered so far by the agent.",
-    )
-    meaningful_steps: List[str] = Field(
-        default_factory=list,
-        description="Unique meaningful step markers used for close gating.",
-    )
+    close_attempts: int = Field(default=0, ge=0)
+    draft_exists: bool = False
+    escalation_recorded: bool = False
+    resolution_recorded: bool = False
 
-    draft_message: Optional[str] = Field(
-        default=None,
-        description="Latest customer-facing response draft.",
-    )
-    escalation_state: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Tracks escalation details and whether escalation happened.",
-    )
-    resolution_state: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Tracks applied operational resolution.",
-    )
-    verification_state: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Tracks whether key facts have been verified.",
-    )
+    action_history: List[Dict[str, Any]] = Field(default_factory=list)
+    can_close: bool = False
 
-    close_attempts: int = Field(
-        default=0,
-        ge=0,
-        description="How many times the agent tried to close the ticket.",
-    )
+
+class SupportState(OpenEnvState):
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    task_id: str
+
+    turn: int = Field(default=0, ge=0)
+    max_turns: int = Field(default=6, ge=1)
+    done: bool = False
+
+    cumulative_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    best_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    last_reward: float = 0.0
+
+    transcript: List[Dict[str, Any]] = Field(default_factory=list)
+    last_action: Optional[Dict[str, Any]] = None
+    last_observation: Optional[Dict[str, Any]] = None
+    violations: List[str] = Field(default_factory=list)
+
+    revealed_sections: List[str] = Field(default_factory=list)
+    revealed_data: Dict[str, Any] = Field(default_factory=dict)
+    meaningful_steps: List[str] = Field(default_factory=list)
+
+    draft_message: Optional[str] = None
+    escalation_state: Dict[str, Any] = Field(default_factory=dict)
+    resolution_state: Dict[str, Any] = Field(default_factory=dict)
+    verification_state: Dict[str, Any] = Field(default_factory=dict)
+
+    hidden_state: HiddenTicketState = Field(default_factory=HiddenTicketState)
+
+    close_attempts: int = Field(default=0, ge=0)
 
 
 class StepResult(BaseModel):
-    """Standard step result returned by the API."""
-
     model_config = ConfigDict(extra="forbid")
 
     observation: SupportObservation
