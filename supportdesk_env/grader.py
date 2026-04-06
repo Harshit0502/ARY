@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import re
-from dataclasses import asdict
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List
 
 from .models import SupportAction
 from .task_bank import TaskSpec
@@ -12,151 +10,168 @@ def _norm(text: str | None) -> str:
     return (text or "").strip().lower()
 
 
-def _keyword_fraction(text: str | None, keywords: list[str]) -> Tuple[float, list[str]]:
-    haystack = _norm(text)
-    if not keywords:
-        return 1.0, []
-    matches = [kw for kw in keywords if kw.lower() in haystack]
-    return len(matches) / len(keywords), matches
-
-
-def _safe_tags(tags: list[str]) -> list[str]:
+def _safe_tags(tags: List[str] | None) -> List[str]:
+    if not tags:
+        return []
     return [t.strip().lower() for t in tags if t and t.strip()]
 
 
-def score_action(task: TaskSpec, action: SupportAction) -> Dict[str, Any]:
-    """Return a deterministic rubric score and per-criterion breakdown."""
+def draft_keyword_hits(task: TaskSpec, message: str | None) -> Dict[str, Any]:
+    """
+    Lightweight helper for checking whether a customer-facing draft
+    contains the expected phrases for the task.
+    """
+    text = _norm(message)
+    required = [p.lower() for p in task.expected_resolution.get("draft_must_include", [])]
 
-    criteria: Dict[str, float] = {}
-    violations: list[str] = []
+    hits: List[str] = []
+    missing: List[str] = []
 
-    # Core routing fields
-    criteria["team"] = 1.0 if _norm(action.team) == task.target_team else 0.0
-    criteria["priority"] = 1.0 if _norm(action.priority) == task.target_priority else 0.0
-    criteria["issue_type"] = 1.0 if _norm(action.issue_type) == task.target_issue_type else 0.0
+    for phrase in required:
+        if phrase == "no eta":
+            if (
+                "no eta" in text
+                or "do not have an eta" in text
+                or "don't have an eta" in text
+                or "dont have an eta" in text
+            ):
+                hits.append(phrase)
+            else:
+                missing.append(phrase)
+        elif phrase == "workaround":
+            if "workaround" in text or "failover endpoint" in text:
+                hits.append(phrase)
+            else:
+                missing.append(phrase)
+        elif phrase in text:
+            hits.append(phrase)
+        else:
+            missing.append(phrase)
 
-    if task.target_severity is None:
-        criteria["severity"] = 1.0 if action.severity is None else 0.5
-    else:
-        criteria["severity"] = 1.0 if _norm(action.severity) == task.target_severity else 0.0
-
-    # Operational status and tags
-    criteria["status"] = 1.0 if _norm(action.status) == task.target_status else 0.0
-
-    tags = set(_safe_tags(action.tags))
-    required_tags = set(task.required_tags)
-    if required_tags:
-        criteria["tags"] = len(tags & required_tags) / len(required_tags)
-    else:
-        criteria["tags"] = 1.0
-
-    # Message quality / policy compliance
-    message_fraction, matched_phrases = _keyword_fraction(action.message, task.required_phrases)
-    criteria["message_phrases"] = message_fraction
-
-    message_text = _norm(action.message)
-    forbidden_hits = [phrase for phrase in task.forbidden_phrases if phrase.lower() in message_text]
-    if forbidden_hits:
-        violations.extend(f"forbidden_phrase:{phrase}" for phrase in forbidden_hits)
-
-    internal_note_fraction, _ = _keyword_fraction(action.internal_note, task.required_phrases[:2])
-    criteria["internal_note"] = internal_note_fraction
-
-    # A gentle incentive to keep the action type aligned with the phase of work.
-    if task.difficulty == "easy":
-        action_type_bonus = 1.0 if action.action_type in {"classify", "draft_reply", "finalize"} else 0.4
-    elif task.difficulty == "medium":
-        action_type_bonus = 1.0 if action.action_type in {"draft_reply", "resolve", "finalize"} else 0.5
-    else:
-        action_type_bonus = 1.0 if action.action_type in {"escalate", "resolve", "finalize"} else 0.5
-    criteria["action_type"] = action_type_bonus
-
-    if action.confidence < 0.2:
-        violations.append("low_confidence")
-
-    weights: Dict[str, float] = {
-        "team": 0.22,
-        "priority": 0.16,
-        "issue_type": 0.14,
-        "severity": 0.10,
-        "status": 0.10,
-        "tags": 0.10,
-        "message_phrases": 0.14,
-        "internal_note": 0.04,
-        "action_type": 0.10,
-    }
-
-    raw = sum(criteria[name] * weight for name, weight in weights.items())
-
-    # Penalties for clearly bad behavior.
-    penalty = 0.0
-    if forbidden_hits:
-        penalty += min(0.25, 0.08 * len(forbidden_hits))
-    if action.refund_amount is not None and action.refund_amount > 0 and task.task_id != "duplicate_charge_refund":
-        penalty += 0.08
-    if action.severity and task.target_severity is None:
-        penalty += 0.03
-    if action.action_type == "finalize" and raw < 0.75:
-        penalty += 0.05
-
-    score = max(0.0, min(1.0, raw - penalty))
-    explanation = _build_explanation(task, criteria, violations, matched_phrases)
+    ratio = 1.0 if not required else len(hits) / len(required)
     return {
-        "score": score,
-        "criteria": criteria,
-        "penalty": penalty,
-        "violations": violations,
-        "explanation": explanation,
+        "ratio": ratio,
+        "hits": hits,
+        "missing": missing,
     }
 
 
-def _build_explanation(
+def forbidden_phrase_hits(task: TaskSpec, message: str | None) -> List[str]:
+    """
+    Return forbidden phrases found in a draft or note.
+    """
+    text = _norm(message)
+    return [phrase for phrase in task.forbidden_phrases if phrase.lower() in text]
+
+
+def resolution_alignment(task: TaskSpec, action: SupportAction) -> Dict[str, Any]:
+    """
+    Check whether a take_resolution_action payload aligns with the task expectation.
+    """
+    expected = task.expected_resolution
+    expected_type = expected.get("resolution_type")
+    expected_tags = set(t.lower() for t in expected.get("required_tags", []))
+    actual_tags = set(_safe_tags(action.tags))
+
+    resolution_type_match = action.resolution_type == expected_type
+    tag_match_ratio = 1.0 if not expected_tags else len(expected_tags & actual_tags) / len(expected_tags)
+
+    return {
+        "expected_resolution_type": expected_type,
+        "actual_resolution_type": action.resolution_type,
+        "resolution_type_match": resolution_type_match,
+        "tag_match_ratio": tag_match_ratio,
+        "matched_tags": sorted(expected_tags & actual_tags),
+        "missing_tags": sorted(expected_tags - actual_tags),
+    }
+
+
+def escalation_alignment(task: TaskSpec, action: SupportAction) -> Dict[str, Any]:
+    """
+    Check whether an escalation action matches the expected team / priority / severity.
+    """
+    expected = task.expected_resolution
+
+    return {
+        "team_match": _norm(action.team) == _norm(expected.get("team")),
+        "priority_match": _norm(action.priority) == _norm(expected.get("priority")),
+        "severity_match": _norm(action.severity) == _norm(expected.get("severity"))
+        if expected.get("severity") is not None
+        else action.severity is None,
+        "expected_team": expected.get("team"),
+        "expected_priority": expected.get("priority"),
+        "expected_severity": expected.get("severity"),
+    }
+
+
+def required_actions_status(task: TaskSpec, action_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Summarize which required actions have already been taken.
+    """
+    taken = {
+        entry.get("action", {}).get("action_type")
+        for entry in action_history
+        if isinstance(entry, dict)
+    }
+
+    required = [a for a in task.required_actions if a != "close_ticket"]
+    missing = [a for a in required if a not in taken]
+
+    return {
+        "required": required,
+        "taken": sorted(a for a in taken if a),
+        "missing": missing,
+        "all_required_done": len(missing) == 0,
+    }
+
+
+def build_close_readiness_report(
     task: TaskSpec,
-    criteria: Dict[str, float],
-    violations: list[str],
-    matched_phrases: list[str],
-) -> str:
-    top_hits = []
-    if criteria.get("team", 0) >= 1.0:
-        top_hits.append("team")
-    if criteria.get("priority", 0) >= 1.0:
-        top_hits.append("priority")
-    if criteria.get("issue_type", 0) >= 1.0:
-        top_hits.append("issue type")
-    if criteria.get("message_phrases", 0) > 0:
-        top_hits.append(f"phrases:{', '.join(matched_phrases[:3])}")
+    *,
+    revealed_sections: List[str],
+    meaningful_steps: List[str],
+    draft_message: str | None,
+    violations: List[str] | None = None,
+) -> Dict[str, Any]:
+    """
+    Helper report for whether a case is structurally ready to close.
+    This does not replace the environment's final close check, but keeps
+    the logic reusable and testable.
+    """
+    violations = violations or []
+    revealed = set(revealed_sections)
+    required_sections = set(task.required_revealed_sections)
 
-    bits = []
-    if top_hits:
-        bits.append("matched " + "; ".join(top_hits))
-    if violations:
-        bits.append("violations: " + ", ".join(violations[:3]))
-    if not bits:
-        bits.append("partial progress only")
-    return f"{task.title}: " + " | ".join(bits)
+    draft_report = draft_keyword_hits(task, draft_message)
+    forbidden_hits = forbidden_phrase_hits(task, draft_message)
 
+    missing: List[str] = []
 
-def build_feedback(task: TaskSpec, rubric: Dict[str, Any]) -> str:
-    criteria = rubric["criteria"]
-    lines = []
-    if criteria.get("team", 0) < 1.0:
-        lines.append(f"route to {task.target_team}")
-    if criteria.get("priority", 0) < 1.0:
-        lines.append(f"set priority {task.target_priority}")
-    if criteria.get("issue_type", 0) < 1.0:
-        lines.append(f"label the issue as {task.target_issue_type}")
-    if task.target_severity and criteria.get("severity", 0) < 1.0:
-        lines.append(f"set severity {task.target_severity}")
-    if criteria.get("tags", 0) < 1.0:
-        lines.append("apply the required tags")
-    if criteria.get("message_phrases", 0) < 1.0:
-        lines.append("include the required customer-facing phrases")
-    if rubric["violations"]:
-        lines.append("remove forbidden language")
-    if not lines:
-        lines.append("good progress; finalize the case cleanly")
-    return "; ".join(lines)
+    if len(set(meaningful_steps)) < task.min_meaningful_steps:
+        missing.append(
+            f"need at least {task.min_meaningful_steps} meaningful steps"
+        )
+
+    for section in sorted(required_sections):
+        if section not in revealed:
+            missing.append(f"required data section '{section}' not revealed")
+
+    if not draft_message:
+        missing.append("draft response missing")
+    elif draft_report["missing"]:
+        missing.append("draft response is missing required customer-facing details")
+
+    if forbidden_hits or violations:
+        missing.append("draft or case history contains policy-risky language")
+
+    return {
+        "can_close_structurally": len(missing) == 0,
+        "missing": missing,
+        "draft_hits": draft_report["hits"],
+        "draft_missing": draft_report["missing"],
+        "forbidden_hits": forbidden_hits,
+    }
 
 
 def summarize_action(action: SupportAction) -> Dict[str, Any]:
-    return action.model_dump()
+    return action.model_dump(exclude_none=True)

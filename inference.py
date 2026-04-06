@@ -18,7 +18,7 @@ load_dotenv()
 
 logger = get_logger("inference")
 
-BENCHMARK = "supportdesk_v1"
+BENCHMARK = "supportdesk_v2"
 DEFAULT_ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
 DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL", "https://api-inference.huggingface.co/v1")
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr-7b-beta")
@@ -26,12 +26,7 @@ LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", DEFAULT_MODEL_NAME)
 
 
 class HFChatClient:
-    """Minimal Hugging Face chat-completions client.
-
-    This intentionally uses plain requests so offline mode has no dependency on
-    provider SDK imports. The endpoint follows the OpenAI-compatible Hugging Face
-    Inference API shape at: {API_BASE_URL}/chat/completions.
-    """
+    """Minimal Hugging Face chat-completions client."""
 
     def __init__(self, api_base_url: str, token: str, timeout: float = 60.0) -> None:
         self.api_base_url = api_base_url.rstrip("/")
@@ -68,11 +63,9 @@ class HFChatClient:
 
 
 def build_model_client(api_base_url: str | None = None) -> HFChatClient:
-    """Create the Hugging Face client only when needed."""
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN is required unless --offline is set.")
-
     return HFChatClient(api_base_url=api_base_url or DEFAULT_API_BASE_URL, token=token)
 
 
@@ -109,41 +102,206 @@ def _extract_json(text: str) -> Dict[str, Any]:
     raise ValueError(f"Could not parse JSON from model output: {text[:400]}")
 
 
+def _history_action_types(observation: Dict[str, Any]) -> List[str]:
+    return [
+        str(entry.get("action_type"))
+        for entry in observation.get("action_history", [])
+        if entry.get("action_type")
+    ]
+
+
+def _revealed(observation: Dict[str, Any]) -> Dict[str, Any]:
+    return observation.get("revealed_data", {}) or {}
+
+
+def _login_lockout_action(observation: Dict[str, Any]) -> SupportAction:
+    revealed = _revealed(observation)
+
+    if observation.get("can_close"):
+        return SupportAction(action_type="close_ticket", confidence=0.95)
+
+    if "customer" not in revealed:
+        return SupportAction(
+            action_type="search_customer",
+            query="login reset issue customer lookup",
+            confidence=0.75,
+        )
+
+    if "policy" not in revealed:
+        return SupportAction(
+            action_type="check_policy",
+            policy_key="account_access",
+            confidence=0.80,
+        )
+
+    if not revealed.get("previous_tickets"):
+        return SupportAction(
+            action_type="inspect_previous_tickets",
+            confidence=0.62,
+        )
+
+    history = _history_action_types(observation)
+    if "take_resolution_action" not in history:
+        return SupportAction(
+            action_type="take_resolution_action",
+            resolution_type="reissue_reset_link",
+            status="completed",
+            tags=["login", "password-reset"],
+            resolution_payload={
+                "channel": "email",
+                "reason": "customer still cannot log in after reset attempt",
+            },
+            internal_note="Reissued reset link after checking account-access guidance.",
+            confidence=0.86,
+        )
+
+    if "draft_response" not in history:
+        return SupportAction(
+            action_type="draft_response",
+            message=(
+                "Sorry for the trouble. I have reissued your reset link. "
+                "Please check your spam or junk folder if you do not see it right away, "
+                "and make sure you have access to your trusted 2FA device when signing in. "
+                "For security, we do not need your password or OTP."
+            ),
+            confidence=0.88,
+        )
+
+    return SupportAction(action_type="close_ticket", confidence=0.93)
+
+
+def _duplicate_charge_action(observation: Dict[str, Any]) -> SupportAction:
+    revealed = _revealed(observation)
+
+    if observation.get("can_close"):
+        return SupportAction(action_type="close_ticket", confidence=0.96)
+
+    if "customer" not in revealed:
+        return SupportAction(
+            action_type="search_customer",
+            query="duplicate subscription charge customer lookup",
+            confidence=0.78,
+        )
+
+    if "order" not in revealed or "payment" not in revealed:
+        customer = revealed.get("customer", {})
+        return SupportAction(
+            action_type="view_order",
+            customer_id=customer.get("customer_id"),
+            confidence=0.84,
+        )
+
+    if "policy" not in revealed:
+        return SupportAction(
+            action_type="check_policy",
+            policy_key="billing_refunds",
+            confidence=0.84,
+        )
+
+    history = _history_action_types(observation)
+    if "take_resolution_action" not in history:
+        payment = revealed.get("payment", {})
+        order = revealed.get("order", {})
+        duplicate_payment_id = None
+        for charge in payment.get("charges", []):
+            if charge.get("duplicate_of"):
+                duplicate_payment_id = charge.get("payment_id")
+                break
+
+        return SupportAction(
+            action_type="take_resolution_action",
+            resolution_type="issue_refund",
+            status="completed",
+            tags=["billing", "refund", "duplicate-charge"],
+            resolution_payload={
+                "order_id": order.get("order_id"),
+                "duplicate_payment_id": duplicate_payment_id,
+                "refund_destination": "original_payment_method",
+            },
+            internal_note="Verified duplicate captured payment and issued refund to original payment method.",
+            confidence=0.90,
+        )
+
+    if "draft_response" not in history:
+        return SupportAction(
+            action_type="draft_response",
+            message=(
+                "Sorry about the duplicate charge. I verified the duplicate payment and have issued a refund "
+                "to your original payment method. Most banks reflect the refund within 3-5 business days."
+            ),
+            confidence=0.90,
+        )
+
+    return SupportAction(action_type="close_ticket", confidence=0.94)
+
+
+def _eu_outage_action(observation: Dict[str, Any]) -> SupportAction:
+    revealed = _revealed(observation)
+
+    if observation.get("can_close"):
+        return SupportAction(action_type="close_ticket", confidence=0.96)
+
+    if "customer" not in revealed:
+        return SupportAction(
+            action_type="search_customer",
+            query="eu outage affected tenant lookup",
+            confidence=0.78,
+        )
+
+    if "policy" not in revealed:
+        return SupportAction(
+            action_type="check_policy",
+            policy_key="incident_response",
+            confidence=0.83,
+        )
+
+    history = _history_action_types(observation)
+    if "escalate_case" not in history:
+        return SupportAction(
+            action_type="escalate_case",
+            team="incident_management",
+            priority="urgent",
+            severity="sev2",
+            status="handoff_in_progress",
+            tags=["incident", "outage", "eu"],
+            internal_note="Material EU impact observed; routing to incident management as sev2.",
+            confidence=0.91,
+        )
+
+    if "take_resolution_action" not in history:
+        return SupportAction(
+            action_type="take_resolution_action",
+            resolution_type="publish_status_update",
+            status="handoff_complete",
+            tags=["incident", "outage", "eu"],
+            resolution_payload={
+                "status_page": True,
+                "workaround": "Customers may retry requests against the failover endpoint while mitigation is in progress.",
+            },
+            internal_note="Published safe incident update with approved workaround and no exact ETA.",
+            confidence=0.90,
+        )
+
+    if "draft_response" not in history:
+        return SupportAction(
+            action_type="draft_response",
+            message=(
+                "We are actively investigating the EU service disruption and have posted an update on the status page. "
+                "We do not have an ETA right now. As a temporary workaround, customers may retry requests against the "
+                "failover endpoint while mitigation is in progress."
+            ),
+            confidence=0.91,
+        )
+
+    return SupportAction(action_type="close_ticket", confidence=0.94)
+
+
 def _offline_policy(task_id: str, observation: Dict[str, Any]) -> SupportAction:
-    task = get_task(task_id)
-
     if task_id == "login_lockout":
-        message = (
-            "Sorry for the trouble. Please use the reset link, check spam for the email, "
-            "and confirm 2fa on the current device if access is still blocked."
-        )
-    elif task_id == "duplicate_charge_refund":
-        message = (
-            "Sorry about the duplicate charge. We have routed this to billing, and the refund "
-            "will go to the original payment method within 3-5 business days."
-        )
-    else:
-        message = (
-            "We are investigating the outage, have updated the status page, and will share the "
-            "current workaround while the incident team continues mitigation."
-        )
-
-    action_kwargs: Dict[str, Any] = {
-        "action_type": "finalize",
-        "issue_type": task.target_issue_type,
-        "priority": task.target_priority,
-        "team": task.target_team,
-        "status": task.target_status,
-        "tags": task.required_tags,
-        "message": message,
-        "internal_note": f"Route to {task.target_team}; satisfy required phrases.",
-        "confidence": 0.72,
-    }
-
-    if task.target_severity is not None:
-        action_kwargs["severity"] = task.target_severity
-
-    return SupportAction(**action_kwargs)
+        return _login_lockout_action(observation)
+    if task_id == "duplicate_charge_refund":
+        return _duplicate_charge_action(observation)
+    return _eu_outage_action(observation)
 
 
 def _call_model_action(
@@ -155,11 +313,13 @@ def _call_model_action(
     task = get_task(task_id)
 
     system = (
-        "You are a support operations agent. Produce exactly one JSON object with keys: "
-        "action_type, issue_type, priority, team, severity, status, tags, message, "
-        "internal_note, refund_amount, confidence. "
-        "Only include fields that help. "
-        "Keep the message professional, concise, and policy-safe."
+        "You are a support operations agent acting inside a multi-step environment. "
+        "You do NOT know all facts at reset. "
+        "Choose exactly one next operational action that best improves progress based only on the current observation. "
+        "Valid action_type values are: search_customer, view_order, check_policy, "
+        "inspect_previous_tickets, draft_response, escalate_case, take_resolution_action, close_ticket. "
+        "Do not jump to close_ticket unless the observation says can_close=true. "
+        "Return exactly one valid JSON object matching the action schema. No markdown. No explanation."
     )
 
     user = {
@@ -167,12 +327,18 @@ def _call_model_action(
             "task_id": task.task_id,
             "title": task.title,
             "difficulty": task.difficulty,
-            "inbox_summary": task.inbox_summary,
-            "open_questions": task.open_questions,
+            "inbox_summary": task.public_inbox_summary,
+            "open_questions": task.public_open_questions,
             "constraints": task.constraints,
+            "allowed_actions": task.allowed_actions,
         },
         "observation": observation,
-        "instruction": "Return only valid JSON. Use the most helpful single step for improving the score.",
+        "instruction": (
+            "Pick the single best next action. "
+            "Use currently revealed_data and action_history. "
+            "If key information is still missing, inspect before acting. "
+            "If a response is drafted, keep it concise and policy-safe."
+        ),
     }
 
     resp = model_client.create_chat_completion(
@@ -182,13 +348,10 @@ def _call_model_action(
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
+        max_tokens=350,
     )
 
-    content = (
-        resp.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "{}")
-    )
+    content = resp.get("choices", [{}])[0].get("message", {}).get("content", "{}")
     data = _extract_json(content)
     return SupportAction.model_validate(data)
 
@@ -225,14 +388,18 @@ def run_episode(
     use_offline: bool,
     model: str,
     model_client: Optional[HFChatClient] = None,
-    max_turns: int = 4,
+    max_turns: Optional[int] = None,
     fallback_to_offline_on_model_error: bool = False,
 ) -> Dict[str, Any]:
+    task = get_task(task_id)
+    turn_budget = max_turns or task.max_turns
+
     reset_result = env.reset(task_id=task_id)
     observation = reset_result.observation
     rewards: List[float] = []
+    last_done_reason = "continue"
 
-    for turn in range(max_turns):
+    for turn in range(turn_budget):
         obs_dict = observation.model_dump()
 
         if use_offline:
@@ -255,6 +422,7 @@ def run_episode(
         reward = step_result.reward.total
         done = step_result.done
         error = step_result.info.get("error")
+        last_done_reason = str(step_result.info.get("done_reason", "continue"))
 
         rewards.append(reward)
         _print_step(
@@ -270,7 +438,7 @@ def run_episode(
 
     final_state = env.state()
     final_score = final_state.best_score
-    success = final_score >= 1.0
+    success = last_done_reason == "closed"
 
     _print_end(
         success=success,
@@ -281,11 +449,12 @@ def run_episode(
 
     return {
         "task_id": task_id,
-        "difficulty": get_task(task_id).difficulty,
+        "difficulty": task.difficulty,
         "final_score": final_score,
         "turns": final_state.turn,
         "transcript": final_state.transcript,
         "success": success,
+        "done_reason": last_done_reason,
     }
 
 
@@ -300,6 +469,7 @@ def main() -> None:
         help="If model inference fails, fall back to offline heuristic.",
     )
     parser.add_argument("--tasks", nargs="*", default=TASK_ORDER, help="Task ids to run.")
+    parser.add_argument("--max-turns", type=int, default=None, help="Optional override for turn budget per task.")
     args = parser.parse_args()
 
     env = SupportDeskClient(base_url=args.env_url)
@@ -324,6 +494,7 @@ def main() -> None:
             use_offline=args.offline,
             model=args.model,
             model_client=model_client,
+            max_turns=args.max_turns,
             fallback_to_offline_on_model_error=args.allow_fallback_offline,
         )
         results.append(result)
