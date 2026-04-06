@@ -1,0 +1,6 @@
+spec_version: 1
+name: supportdesk_openenv
+type: space
+runtime: fastapi
+app: supportdesk_env.server.app:app
+port: 7860
