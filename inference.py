@@ -13,6 +13,10 @@ from supportdesk_env.client import SupportDeskClient
 from supportdesk_env.logging_config import get_logger
 from supportdesk_env.models import SupportAction
 from supportdesk_env.task_bank import TASK_ORDER, get_task
+from huggingface_hub import InferenceClient
+from typing import Any, Dict, List
+import os
+
 
 load_dotenv()
 
@@ -24,20 +28,12 @@ DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr-7b-beta")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", DEFAULT_MODEL_NAME)
 
-
 class HFChatClient:
-    """Minimal Hugging Face chat-completions client."""
-
     def __init__(self, api_base_url: str, token: str, timeout: float = 60.0) -> None:
-        self.api_base_url = api_base_url.rstrip("/")
+        self.api_base_url = api_base_url
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            }
-        )
+        self.token = token.strip()
+        self.client = InferenceClient(api_key=self.token)
 
     def create_chat_completion(
         self,
@@ -47,27 +43,25 @@ class HFChatClient:
         temperature: float = 0.0,
         max_tokens: int = 400,
     ) -> Dict[str, Any]:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        response = self.session.post(f"{self.api_base_url}/chat/completions",
-        json=payload,
-        timeout=self.timeout,)
         try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-                raise RuntimeError(
-        f"HF request failed: status={response.status_code} "f"url={response.url} body={response.text[:1000]}") from exc
-        return response.json()
+            out = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return out.model_dump() if hasattr(out, "model_dump") else out
+        except Exception as exc:
+            raise RuntimeError(f"HF chat completion failed for model={model}: {exc}") from exc
 
 def build_model_client(api_base_url: str | None = None) -> HFChatClient:
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    token = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or "").strip()
     if not token:
         raise RuntimeError("HF_TOKEN is required unless --offline is set.")
-    return HFChatClient(api_base_url=api_base_url or DEFAULT_API_BASE_URL, token=token)
+    return HFChatClient(
+        api_base_url=api_base_url or DEFAULT_API_BASE_URL,
+        token=token,
+    )
 
 
 def _compact(value: Any) -> Any:
@@ -102,6 +96,82 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
     raise ValueError(f"Could not parse JSON from model output: {text[:400]}")
 
+def _sanitize_action_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_fields = set(SupportAction.model_fields.keys())
+    cleaned: Dict[str, Any] = {}
+
+    for key, value in data.items():
+        if key in allowed_fields:
+            cleaned[key] = value
+
+    # Map common extra field into an allowed field instead of crashing.
+    if "policy_guidance" in data and not cleaned.get("internal_note"):
+        cleaned["internal_note"] = str(data["policy_guidance"])
+
+    # Keep types safe
+    if cleaned.get("tags") is None:
+        cleaned["tags"] = []
+    elif not isinstance(cleaned["tags"], list):
+        cleaned["tags"] = [str(cleaned["tags"])]
+
+    if cleaned.get("resolution_payload") is None:
+        cleaned["resolution_payload"] = {}
+
+    if cleaned.get("confidence") is None:
+        cleaned["confidence"] = 0.0
+    
+    valid_priorities = {"low", "medium", "high", "urgent"}
+    valid_severities = {"sev4", "sev3", "sev2", "sev1"}
+
+    priority = cleaned.get("priority")
+    severity = cleaned.get("severity")
+
+    # Model sometimes swaps priority and severity, e.g. priority="sev2", severity="medium"
+    if priority in valid_severities and severity in valid_priorities:
+        cleaned["priority"], cleaned["severity"] = severity, priority
+    else:
+        # If only one side is clearly misplaced, repair it.
+        if priority in valid_severities and severity not in valid_severities:
+            cleaned["severity"] = priority
+            cleaned["priority"] = "high" if cleaned.get("action_type") == "escalate_case" else None
+
+        if severity in valid_priorities and priority not in valid_priorities:
+            cleaned["priority"] = severity
+            cleaned["severity"] = "sev2" if cleaned.get("action_type") == "escalate_case" else None
+
+    # Final fallback for escalation actions
+    if cleaned.get("action_type") == "escalate_case":
+        if cleaned.get("priority") not in valid_priorities:
+            cleaned["priority"] = "high"
+        if cleaned.get("severity") not in valid_severities:
+            cleaned["severity"] = "sev2"
+    valid_priorities = {"low", "medium", "high", "urgent"}
+    valid_severities = {"sev4", "sev3", "sev2", "sev1"}
+
+    priority = cleaned.get("priority")
+    severity = cleaned.get("severity")
+
+    # Model sometimes swaps priority and severity, e.g. priority="sev2", severity="medium"
+    if priority in valid_severities and severity in valid_priorities:
+        cleaned["priority"], cleaned["severity"] = severity, priority
+    else:
+        # If only one side is clearly misplaced, repair it.
+        if priority in valid_severities and severity not in valid_severities:
+            cleaned["severity"] = priority
+            cleaned["priority"] = "high" if cleaned.get("action_type") == "escalate_case" else None
+
+        if severity in valid_priorities and priority not in valid_priorities:
+            cleaned["priority"] = severity
+            cleaned["severity"] = "sev2" if cleaned.get("action_type") == "escalate_case" else None
+
+    # Final fallback for escalation actions
+    if cleaned.get("action_type") == "escalate_case":
+        if cleaned.get("priority") not in valid_priorities:
+            cleaned["priority"] = "high"
+        if cleaned.get("severity") not in valid_severities:
+            cleaned["severity"] = "sev2"
+
+    return cleaned
 
 def _history_action_types(observation: Dict[str, Any]) -> List[str]:
     return [
@@ -314,14 +384,20 @@ def _call_model_action(
     task = get_task(task_id)
 
     system = (
-        "You are a support operations agent acting inside a multi-step environment. "
-        "You do NOT know all facts at reset. "
-        "Choose exactly one next operational action that best improves progress based only on the current observation. "
-        "Valid action_type values are: search_customer, view_order, check_policy, "
-        "inspect_previous_tickets, draft_response, escalate_case, take_resolution_action, close_ticket. "
-        "Do not jump to close_ticket unless the observation says can_close=true. "
-        "Return exactly one valid JSON object matching the action schema. No markdown. No explanation."
-    )
+    "You are a support operations agent acting inside a multi-step environment. "
+    "You do NOT know all facts at reset. "
+    "Choose exactly one next operational action that best improves progress based only on the current observation. "
+    "Valid action_type values are: search_customer, view_order, check_policy, "
+    "inspect_previous_tickets, draft_response, escalate_case, take_resolution_action, close_ticket. "
+    "Do not jump to close_ticket unless the observation says can_close=true. "
+    "Return exactly one valid JSON object. "
+    "Allowed keys only are: "
+    "action_type, query, customer_id, order_id, policy_key, "
+    "team, priority, severity, status, tags, message, internal_note, "
+    "resolution_type, resolution_payload, confidence. "
+    "Do not include any extra keys like policy_guidance, reasoning, explanation, or notes. "
+    "No markdown. No explanation."
+)
 
     user = {
         "task": {
@@ -351,9 +427,9 @@ def _call_model_action(
         ],
         max_tokens=350,
     )
-
     content = resp.get("choices", [{}])[0].get("message", {}).get("content", "{}")
     data = _extract_json(content)
+    data = _sanitize_action_payload(data)
     return SupportAction.model_validate(data)
 
 
@@ -453,7 +529,7 @@ def run_episode(
         "difficulty": task.difficulty,
         "final_score": final_score,
         "turns": final_state.turn,
-        "transcript": final_state.transcript,
+        "transcript": getattr(final_state, "action_history", []),
         "success": success,
         "done_reason": last_done_reason,
     }

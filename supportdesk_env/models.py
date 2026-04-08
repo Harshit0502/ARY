@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - fallback for standalone execution
 
 
 class SupportAction(OpenEnvAction):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     action_type: Literal[
         "search_customer",
