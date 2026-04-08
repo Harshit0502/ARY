@@ -20,7 +20,7 @@ logger = get_logger("inference")
 
 BENCHMARK = "supportdesk_v2"
 DEFAULT_ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
-DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL", "https://api-inference.huggingface.co/v1")
+DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "HuggingFaceH4/zephyr-7b-beta")
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", DEFAULT_MODEL_NAME)
 
@@ -53,14 +53,15 @@ class HFChatClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        response = self.session.post(
-            f"{self.api_base_url}/chat/completions",
-            json=payload,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        response = self.session.post(f"{self.api_base_url}/chat/completions",
+        json=payload,
+        timeout=self.timeout,)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+                raise RuntimeError(
+        f"HF request failed: status={response.status_code} "f"url={response.url} body={response.text[:1000]}") from exc
         return response.json()
-
 
 def build_model_client(api_base_url: str | None = None) -> HFChatClient:
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
